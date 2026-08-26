@@ -6,6 +6,7 @@ import numpy as np
 import pytest
 
 import mojo_pyflann as ours
+from mojo_pyflann._lib import f64
 
 upstream = pytest.importorskip("pyflann")
 
@@ -53,15 +54,23 @@ def test_kdtree_unlimited_checks_is_exact_and_limited_is_valid(data):
 
 def test_linear_simd_tail_and_parallel_threshold_match_upstream():
     rng = np.random.default_rng(31)
-    points = np.ascontiguousarray(rng.normal(size=(400, 11)).astype(np.float32))
-    queries = np.ascontiguousarray(rng.normal(size=(32, 11)).astype(np.float32))
+    points = np.ascontiguousarray(rng.normal(size=(12_000, 11)).astype(np.float32))
+    queries = np.ascontiguousarray(rng.normal(size=(8, 11)).astype(np.float32))
     index = ours.FLANN()
     index.build_index(points, algorithm="linear")
     ref_idx, ref_dist = reference_linear(points, queries, 3)
-    for count in (31, 32):
+    for count in (7, 8):
         got_idx, got_dist = index.nn_index(queries[:count], 3, checks=-1)
         assert np.array_equal(got_idx, ref_idx[:count])
         assert np.allclose(got_dist, ref_dist[:count], rtol=2e-6, atol=2e-6)
+
+
+def test_contiguous_float64_input_is_zero_copy():
+    points = np.ones((4, 3), dtype=np.float64)
+    assert f64(points) is points
+    index = ours.FLANN()
+    index.build_index(points, algorithm="linear")
+    assert index._data is points
 
 
 def test_radius_and_one_shot_nn_match_upstream(data):

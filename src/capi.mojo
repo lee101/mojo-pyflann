@@ -10,12 +10,17 @@ comptime BPtr = Pointer[UInt8, AnyOrigin[mut=True]]
 
 def distance(a: Ptr, b: Ptr, d: Int, metric: Int) -> Float64:
     var total = 0.0
+    comptime W = simd_width_of[DType.float64]()
     if metric == 1:
-        for j in range(d):
+        var j = 0
+        while j + W <= d:
+            var delta = a.unsafe_load[width=W](j) - b.unsafe_load[width=W](j)
+            total += abs(delta).reduce_add()
+            j += W
+        for j in range(j, d):
             var delta = a[unsafe_offset=j] - b[unsafe_offset=j]
             total += -delta if delta < 0.0 else delta
     else:
-        comptime W = simd_width_of[DType.float64]()
         var j = 0
         while j + W <= d:
             var delta = a.unsafe_load[width=W](j) - b.unsafe_load[width=W](j)
@@ -37,6 +42,41 @@ def insert_neighbour(idx: IPtr, dist: Ptr, base: Int, k: Int, point: Int, value:
         slot -= 1
     dist[unsafe_offset=base + slot] = value
     idx[unsafe_offset=base + slot] = Int64(point)
+
+
+def heap_push(nodes: IPtr, bounds: Ptr, size: Int, node: Int, bound: Float64):
+    var slot = size
+    while slot > 0:
+        var parent = (slot - 1) // 2
+        if bounds[unsafe_offset=parent] <= bound:
+            break
+        nodes[unsafe_offset=slot] = nodes[unsafe_offset=parent]
+        bounds[unsafe_offset=slot] = bounds[unsafe_offset=parent]
+        slot = parent
+    nodes[unsafe_offset=slot] = Int64(node)
+    bounds[unsafe_offset=slot] = bound
+
+
+def heap_pop(nodes: IPtr, bounds: Ptr, size: Int) -> Tuple[Int, Float64]:
+    var node = Int(nodes[unsafe_offset=0])
+    var bound = bounds[unsafe_offset=0]
+    var new_size = size - 1
+    if new_size > 0:
+        var tail_node = nodes[unsafe_offset=new_size]
+        var tail_bound = bounds[unsafe_offset=new_size]
+        var slot = 0
+        while slot * 2 + 1 < new_size:
+            var child = slot * 2 + 1
+            if child + 1 < new_size and bounds[unsafe_offset=child + 1] < bounds[unsafe_offset=child]:
+                child += 1
+            if bounds[unsafe_offset=child] >= tail_bound:
+                break
+            nodes[unsafe_offset=slot] = nodes[unsafe_offset=child]
+            bounds[unsafe_offset=slot] = bounds[unsafe_offset=child]
+            slot = child
+        nodes[unsafe_offset=slot] = tail_node
+        bounds[unsafe_offset=slot] = tail_bound
+    return node, bound
 
 
 def linear_query(
@@ -102,28 +142,19 @@ def mpf_knn_kdtree(
             seen[unsafe_offset=point] = 0
         var stack_size = 0
         for tree in range(trees):
-            stack_node[unsafe_offset=stack_size] = roots[unsafe_offset=tree]
-            stack_bound[unsafe_offset=stack_size] = 0.0
+            heap_push(stack_node, stack_bound, stack_size, Int(roots[unsafe_offset=tree]), 0.0)
             stack_size += 1
         var leaves = 0
         while stack_size > 0 and (checks < 0 or leaves < checks):
-            var pick = 0
-            for s in range(1, stack_size):
-                if stack_bound[unsafe_offset=s] < stack_bound[unsafe_offset=pick]:
-                    pick = s
-            var node = Int(stack_node[unsafe_offset=pick])
-            var node_bound = stack_bound[unsafe_offset=pick]
+            var node, node_bound = heap_pop(stack_node, stack_bound, stack_size)
             stack_size -= 1
-            stack_node[unsafe_offset=pick] = stack_node[unsafe_offset=stack_size]
-            stack_bound[unsafe_offset=pick] = stack_bound[unsafe_offset=stack_size]
             while node_dim[unsafe_offset=node] >= 0:
                 var axis = Int(node_dim[unsafe_offset=node])
                 var delta = query[unsafe_offset=q * d + axis] - split[unsafe_offset=node]
                 var near = Int(left[unsafe_offset=node]) if delta <= 0.0 else Int(right[unsafe_offset=node])
                 var far = Int(right[unsafe_offset=node]) if delta <= 0.0 else Int(left[unsafe_offset=node])
                 var extra = delta * delta if metric == 0 else (-delta if delta < 0.0 else delta)
-                stack_node[unsafe_offset=stack_size] = Int64(far)
-                stack_bound[unsafe_offset=stack_size] = node_bound + extra
+                heap_push(stack_node, stack_bound, stack_size, far, node_bound + extra)
                 stack_size += 1
                 node = near
             leaves += 1

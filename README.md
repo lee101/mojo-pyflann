@@ -49,19 +49,19 @@ Measured by `pixi run bench` on this machine (Linux 6.8.0-136-generic, x86_64) u
 
 | case | mojo-pyflann | pyflann | ratio |
 | --- | ---: | ---: | --- |
-| linear exact query: 8k x 400, 24d, k=5 | 13.8 ms | 10.9 ms | 0.79x slower |
-| KD forest query: 30k x 1k, 32d, k=5, checks=32 | 30.8 ms | 10.1 ms | 0.33x slower |
-| KD forest exact query: 8k x 200, 32d, k=5 | 12.4 ms | 7.8 ms | 0.63x slower |
+| linear exact query: 8k x 400, 24d, k=5 | 4.9 ms | 7.1 ms | 1.46x faster |
+| KD forest query: 30k x 1k, 32d, k=5, checks=32 | 6.1 ms | 8.8 ms | 1.45x faster |
+| KD forest exact query: 8k x 200, 32d, k=5 | 7.9 ms | 6.2 ms | 0.78x slower |
 
-The distance kernel uses host-width float64 SIMD with a scalar remainder and parallelizes sufficiently large batches of independent queries. An unlimited KD query is an exact scan, so it uses that kernel directly instead of traversing every KD leaf. Native FLANN remains faster in this run, including the exact case.
+The L1 and L2 distance kernels use host-width float64 SIMD with scalar remainders. Large independent query batches are split across a bounded 16-worker pool; smaller calls remain serial to avoid launch overhead. KD best-bin-first candidates use a binary min-heap instead of rescanning the candidate stack. An unlimited KD query is an exact scan, so it uses the linear kernel directly instead of traversing every KD leaf. The exact case remains slower than native FLANN in this run and is reported as such.
 
-There is no GPU path.
+There is no GPU path. L2 distance performs roughly three floating-point operations per 16 bytes of input loaded (about 0.19 flop/byte), L1 is lower, and KD traversal adds irregular memory traffic. None of these kernels approaches the requested 2 flop/byte threshold, so transfer and launch costs do not justify GPU execution.
 
 ## How it works
 
-The Python facade makes C-contiguous `float64` copies of floating-point input and owns the flat KD-forest arrays. Integer and precision-losing input dtypes are rejected before the ABI call. A tree node stores its split dimension/value, two child indices, or a range into an `int64` point permutation. Query buffers cross one `ctypes` call to `dist/libmojo-pyflann.so`; the C ABI accepts their addresses as `Int`, then rebuilds typed pointers inside Mojo. This follows Mojo's non-parametric export rule and means the kernel neither allocates nor owns Python memory.
+The Python facade preserves C-contiguous `float64` NumPy buffers zero-copy and converts other floating-point inputs once to the kernel's `float64` representation. It owns the flat KD-forest arrays. Integer and precision-losing input dtypes are rejected before the ABI call. A tree node stores its split dimension/value, two child indices, or a range into an `int64` point permutation. Query buffers cross `ctypes` as borrowed addresses; the C ABI rebuilds typed pointers inside Mojo and neither allocates nor owns Python memory.
 
-The linear kernel scans the row-major `(n_samples, n_features)` array and keeps a sorted `k`-element result list. The KD kernel uses a caller-provided best-bin-first stack, marks already inspected points, and searches leaf ranges. All results are sorted nearest first.
+The linear kernel scans the row-major `(n_samples, n_features)` array and keeps a sorted `k`-element result list. The KD kernel uses a caller-provided best-bin-first heap, marks already inspected points, and searches leaf ranges. All results are sorted nearest first.
 
 ## Development
 

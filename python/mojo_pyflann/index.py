@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 
@@ -16,6 +18,8 @@ class FLANNException(RuntimeError):
 
 _DISTANCE = "euclidean"
 _METRICS = {"euclidean": 0, "l2": 0, "manhattan": 1, "l1": 1}
+_MAX_WORKERS = min(16, os.cpu_count() or 1)
+_EXECUTOR = ThreadPoolExecutor(max_workers=_MAX_WORKERS, thread_name_prefix="mojo-pyflann")
 
 
 def set_distance_type(distance_type: str, order: int = 0) -> None:
@@ -146,21 +150,47 @@ class FLANN:
         dist = np.empty((len(query), k), dtype=np.float64)
         metric = _METRICS[self._metric_name]
         checks = int(kwargs.get("checks", self._params.get("checks", 32)))
+        workers = min(_MAX_WORKERS, len(query) // 8)
+        parallel = workers > 1 and len(data) * data.shape[1] * len(query) >= 1_000_000
+
+        def ranges():
+            for worker in range(workers):
+                start = worker * len(query) // workers
+                stop = (worker + 1) * len(query) // workers
+                yield start, stop
+
         if self._algorithm == "linear" or checks < 0:
-            lib().mpf_knn_linear(addr(data), addr(query), addr(idx), addr(dist), len(data), data.shape[1], len(query), k, metric)
+            def linear(start: int, stop: int):
+                lib().mpf_knn_linear(
+                    addr(data), addr(query[start:stop]), addr(idx[start:stop]), addr(dist[start:stop]),
+                    len(data), data.shape[1], stop - start, k, metric,
+                )
+
+            if parallel:
+                for future in [_EXECUTOR.submit(linear, start, stop) for start, stop in ranges()]:
+                    future.result()
+            else:
+                linear(0, len(query))
         else:
             assert self._tree is not None
             tree = self._tree
-            seen = np.empty(len(data), dtype=np.uint8)
-            stack_node = np.empty(len(tree["dim"]), dtype=np.int64)
-            stack_bound = np.empty(len(tree["dim"]), dtype=np.float64)
-            lib().mpf_knn_kdtree(
-                addr(data), addr(query), addr(tree["dim"]), addr(tree["split"]),
-                addr(tree["left"]), addr(tree["right"]), addr(tree["start"]), addr(tree["end"]),
-                addr(tree["perm"]), addr(tree["roots"]), addr(idx), addr(dist), addr(seen),
-                addr(stack_node), addr(stack_bound), len(data), data.shape[1], len(query), k,
-                len(tree["roots"]), checks, metric,
-            )
+            def kdtree(start: int, stop: int):
+                seen = np.empty(len(data), dtype=np.uint8)
+                stack_node = np.empty(len(tree["dim"]), dtype=np.int64)
+                stack_bound = np.empty(len(tree["dim"]), dtype=np.float64)
+                lib().mpf_knn_kdtree(
+                    addr(data), addr(query[start:stop]), addr(tree["dim"]), addr(tree["split"]),
+                    addr(tree["left"]), addr(tree["right"]), addr(tree["start"]), addr(tree["end"]),
+                    addr(tree["perm"]), addr(tree["roots"]), addr(idx[start:stop]), addr(dist[start:stop]),
+                    addr(seen), addr(stack_node), addr(stack_bound), len(data), data.shape[1], stop - start,
+                    k, len(tree["roots"]), checks, metric,
+                )
+
+            if parallel:
+                for future in [_EXECUTOR.submit(kdtree, start, stop) for start, stop in ranges()]:
+                    future.result()
+            else:
+                kdtree(0, len(query))
         if k == 1:
             return idx[:, 0], dist[:, 0]
         return idx, dist
